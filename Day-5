@@ -1,0 +1,261 @@
+Client
+
+import java.io.*;
+import java.net.*;
+import java.util.Scanner;
+
+public class P2PClient {
+    private static String username;
+
+    public static void main(String[] args) {
+        String serverAddress = "127.0.0.1";
+        int port = 12345;
+
+        try (Socket socket = new Socket(serverAddress, port);
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+                Scanner scanner = new Scanner(System.in)) {
+
+            // Request username and join chat
+            while (true) {
+                System.out.println(in.readLine()); // "Enter your username:"
+                username = scanner.nextLine();
+                out.println(username); // Send username to server
+
+                String serverResponse = in.readLine();
+                System.out.println(serverResponse);
+
+                if (!serverResponse.startsWith("[Error]")) {
+                    break; // Username is valid, proceed
+                }
+            }
+
+            // Show message format **only once**
+            System.out.println("You can now send messages!");
+            System.out.println("Message format: @username {message} or @ALL {message}");
+
+            // Thread to listen for incoming messages
+            Thread listenerThread = new Thread(() -> {
+                try {
+                    String serverMessage;
+                    while ((serverMessage = in.readLine()) != null) {
+                        if (serverMessage.contains("shutting down")) {
+                            System.out.println(serverMessage);
+                            System.out.println("Disconnected from the server.");
+                            System.exit(0);
+                        }
+                        System.out.println(serverMessage);
+                    }
+                } catch (IOException e) {
+                    System.out.println("Connection closed.");
+                }
+            });
+            listenerThread.start();
+
+            // Sending messages loop
+            while (true) {
+                String message = scanner.nextLine().trim();
+
+                if (message.isEmpty()) {
+                    System.out.println("[Error] Message cannot be empty.");
+                    continue;
+                }
+
+                if (message.equalsIgnoreCase("exit")) {
+                    out.println("exit");
+                    break;
+                }
+
+                out.println(message);
+            }
+        } catch (IOException e) {
+            System.out.println("Server is unreachable.");
+        }
+    }
+}
+
+
+
+Server
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class P2PServer {
+    private static final int PORT = 12345;
+    private static Map<String, PrintWriter> clients = new ConcurrentHashMap<>();
+    private static BlockingQueue<String> messageQueue = new LinkedBlockingQueue<>();
+    private static volatile boolean running = true; // Flag for server status
+
+    public static void main(String[] args) {
+        System.out.println("P2P Chat Server is running...");
+
+        // Start command listener for server shutdown
+        new Thread(P2PServer::listenForCommands).start();
+
+        // Thread to process messages from the queue
+        new Thread(() -> {
+            while (running) {
+                try {
+                    String message = messageQueue.take();
+                    processMessage(message);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }).start();
+
+        // Start server socket
+        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+            while (running) {
+                try {
+                    Socket clientSocket = serverSocket.accept();
+                    new Thread(new ClientHandler(clientSocket)).start();
+                } catch (IOException e) {
+                    if (!running)
+                        break; // Stop accepting new connections if shutting down
+                    e.printStackTrace();
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        System.out.println("Server has shut down.");
+    }
+
+    // Handles incoming messages
+    private static void processMessage(String message) {
+        String[] parts = message.split(" ", 3);
+        if (parts.length < 3)
+            return;
+
+        String sender = parts[0];
+        String targetUser = parts[1].substring(1); // Remove '@'
+        String msg = parts[2];
+
+        if (targetUser.equalsIgnoreCase("ALL")) {
+            // Broadcast message to all clients except the sender
+            for (Map.Entry<String, PrintWriter> entry : clients.entrySet()) {
+                if (!entry.getKey().equals(sender)) {
+                    entry.getValue().println(sender + " -> @ALL: " + msg);
+                }
+            }
+            return;
+        }
+
+        if (sender.equals(targetUser)) {
+            clients.get(sender).println("[Error] You cannot send messages to yourself.");
+            return;
+        }
+
+        PrintWriter targetWriter = clients.get(targetUser);
+        if (targetWriter != null) {
+            targetWriter.println(sender + " -> You: " + msg);
+        } else {
+            clients.get(sender).println("[Error] User @" + targetUser + " not found.");
+        }
+    }
+
+    // Handles client connections
+    static class ClientHandler implements Runnable {
+        private Socket socket;
+        private String username;
+        private PrintWriter out;
+        private BufferedReader in;
+
+        public ClientHandler(Socket socket) {
+            this.socket = socket;
+        }
+
+        @Override
+        public void run() {
+            try {
+                in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                out = new PrintWriter(socket.getOutputStream(), true);
+
+                // Get a unique username
+                while (true) {
+                    out.println("Enter your username:");
+                    username = in.readLine().trim();
+
+                    if (username.isEmpty()) {
+                        out.println("[Error] Username cannot be empty.");
+                    } else if (clients.containsKey(username)) {
+                        out.println("[Error] Username already taken. Try another one.");
+                    } else if (username.equalsIgnoreCase("ALL")) {
+                        out.println("[Error] 'ALL' is a reserved keyword. Try another username.");
+                    } else {
+                        synchronized (clients) {
+                            clients.put(username, out);
+                        }
+                        break;
+                    }
+                }
+
+                System.out.println(username + " joined the chat.");
+                out.println("Welcome to the chat, " + username + "!");
+
+                // Listen for messages
+                String message;
+                while (running && (message = in.readLine()) != null) {
+                    if (message.equalsIgnoreCase("exit")) {
+                        break;
+                    }
+
+                    if (!message.matches("^@(ALL|[a-zA-Z0-9]+)\\s.+$")) {
+                        out.println("[Error] Invalid message format. Use @username message or @ALL message.");
+                        continue;
+                    }
+
+                    if (message.length() > 500) {
+                        out.println("[Error] Message too long. Keep it under 500 characters.");
+                        continue;
+                    }
+
+                    messageQueue.put(username + " " + message);
+                }
+            } catch (IOException | InterruptedException e) {
+                System.out.println(username + " disconnected.");
+            } finally {
+                if (username != null) {
+                    clients.remove(username);
+                    System.out.println(username + " left.");
+                }
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    System.out.println("Error closing connection for " + username);
+                }
+            }
+        }
+    }
+
+    // Admin command listener (for shutting down the server)
+    private static void listenForCommands() {
+        Scanner scanner = new Scanner(System.in);
+        while (running) {
+            String command = scanner.nextLine().trim();
+            if (command.equalsIgnoreCase("shutdown")) {
+                shutdownServer();
+                break;
+            }
+        }
+    }
+
+    // Graceful server shutdown
+    private static void shutdownServer() {
+        System.out.println("Shutting down server...");
+        running = false;
+
+        // Notify all clients
+        for (PrintWriter client : clients.values()) {
+            client.println("[Server] The server is shutting down. You will be disconnected.");
+        }
+
+        // Close all client connections
+        clients.clear();
+    }
+}
